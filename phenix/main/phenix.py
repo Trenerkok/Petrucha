@@ -1,6 +1,7 @@
 import os
 import json
 import queue
+import logging  # BEGIN NLU MOD
 import sounddevice as sd
 import vosk
 import threading
@@ -19,6 +20,12 @@ from selenium.webdriver.chrome.options import Options
 import serial
 import re
 from gtts import gTTS
+
+# BEGIN NLU MOD
+from command_executor import CommandExecutor
+from llm_client import LLMClient
+from nlu_interpreter import NLUInterpreter
+# END NLU MOD
 
 # ----------------
 # --- Опції ---
@@ -78,6 +85,16 @@ q = queue.Queue()
 
 # --- tts init ---
 mixer.init()
+
+# BEGIN NLU MOD
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+LOGGER = logging.getLogger(__name__)
+nlu_interpreter = None
+structured_executor = None
+# END NLU MOD
 
 def speak(text):
     print(f"[TTS] {text}")
@@ -294,10 +311,38 @@ def command_mode():
                             speak("Повертаюсь у режим очікування.")
                             return
                 else:
-                    speak("Жодну команду не розпізнано, скажіть ще раз чи 'стоп' для виходу.")
+                    # BEGIN NLU MOD
+                    LOGGER.info("Rule-based parser не знайшов команд. Використовую NLU для: %s", text)
+                    if nlu_interpreter and structured_executor:
+                        structured_cmds = nlu_interpreter.interpret(text)
+                        if not structured_cmds:
+                            speak("Я не зрозумів команду, повтори, будь ласка.")
+                        else:
+                            for structured_cmd in structured_cmds:
+                                handled = structured_executor.execute(structured_cmd)
+                                if not handled:
+                                    speak("Поки що не можу виконати цю команду.")
+                    else:
+                        speak("Я не зрозумів команду, повтори, будь ласка.")
+                    # END NLU MOD
 
 
 def main():
+    # BEGIN NLU MOD
+    global nlu_interpreter, structured_executor
+    if nlu_interpreter is None:
+        try:
+            llm_client = LLMClient(
+                base_url=os.getenv("LMSTUDIO_BASE_URL", "http://127.0.0.1:1234"),
+                model=os.getenv("LMSTUDIO_MODEL", "local-assistant"),
+            )
+            nlu_interpreter = NLUInterpreter(llm_client)
+        except Exception as exc:  # pragma: no cover
+            LOGGER.error("Не вдалося ініціалізувати NLU: %s", exc)
+            nlu_interpreter = None
+    if structured_executor is None:
+        structured_executor = CommandExecutor(speak, execute_cmd)
+    # END NLU MOD
     threading.Thread(target=voice_mode, daemon=True).start()
     with sd.RawInputStream(samplerate=samplerate, dtype='int16', channels=1, callback=audio_callback):
         while True:

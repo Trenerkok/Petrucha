@@ -45,4 +45,8 @@ class NLUInterpreter:
                 valid_commands.append(item)
             else:
                 LOGGER.warning("Skipping invalid command item: %s", item)
+        print(
+            f"[NLUInterpreter] Parsed {len(valid_commands)} commands, first intent: "
+            f"{valid_commands[0].get('intent') if valid_commands else 'none'}"
+        )
         return valid_commands

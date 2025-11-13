@@ -61,12 +61,16 @@ class LLMClient:
             "response_format": {"type": "json_object"},
         }
         url = f"{self.base_url}/v1/chat/completions"
+        print("[LLMClient] Sending request to", self.base_url)
         try:
             response = self.session.post(url, json=payload, timeout=self.timeout)
             response.raise_for_status()
         except requests.RequestException as exc:
             LOGGER.error("LLM request failed: %s", exc)
             return None
+
+        print("[LLMClient] HTTP status:", response.status_code)
+        print("[LLMClient] Raw content (truncated):", response.text[:200])
 
         try:
             data = response.json()

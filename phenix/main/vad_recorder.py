@@ -73,7 +73,6 @@ class VADUtteranceRecorder:
                 if overflowed:
                     LOGGER.warning("VAD: overflowed audio buffer")
 
-                # frames.shape == (N, 1) -> робимо 1D
                 block = frames.reshape(-1).astype("float32")
                 rms = self._compute_rms(block)
 
@@ -85,7 +84,6 @@ class VADUtteranceRecorder:
                     voice_blocks = 0
 
                 if not started:
-                    # Ще не почали запис фрази
                     if voice_blocks >= self.min_voice_blocks:
                         started = True
                         LOGGER.info(
@@ -95,17 +93,14 @@ class VADUtteranceRecorder:
                         )
                         collected_blocks.append(block)
                 else:
-                    # Уже записуємо фразу
                     collected_blocks.append(block)
 
-                    # Перевірка на кінець фрази
                     if silence_blocks >= self.max_silence_blocks:
                         LOGGER.info(
                             "VAD: кінець фрази (silence_blocks=%d)", silence_blocks
                         )
                         break
 
-                    # Захист від дуже довгої фрази / шуму
                     if len(collected_blocks) >= max_blocks_total:
                         LOGGER.info(
                             "VAD: досягнуто максимальну тривалість фрази (%d blocks)",

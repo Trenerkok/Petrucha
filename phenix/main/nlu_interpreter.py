@@ -1,10 +1,8 @@
-"""LLM-powered interpreter that transforms ASR text into structured commands."""
 from __future__ import annotations
 
 import logging
 from typing import List
 
-from llm_client import LLMClient
 from nlu_prompt import NLU_SYSTEM_PROMPT
 
 LOGGER = logging.getLogger(__name__)
@@ -13,7 +11,11 @@ LOGGER = logging.getLogger(__name__)
 class NLUInterpreter:
     """Convert noisy ASR text to structured command dictionaries."""
 
-    def __init__(self, llm_client: LLMClient) -> None:
+    def __init__(self, llm_client) -> None:
+        """
+        llm_client повинен мати метод request_json(system_prompt, user_message, extra_messages=None)
+        (наприклад, GeminiClient або LLMClient).
+        """
         self._llm_client = llm_client
 
     def interpret(self, asr_text: str) -> List[dict]:

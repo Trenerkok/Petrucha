@@ -1,4 +1,3 @@
-"""Client for interacting with a local LM Studio HTTP endpoint."""
 from __future__ import annotations
 import json
 import logging
@@ -51,7 +50,6 @@ class LLMClient:
         extra_messages: Optional[Iterable[dict]] = None,
     ) -> Optional[str]:
         """Send a chat completion request and return the raw string content."""
-        
         messages = self._build_messages(system_prompt, user_prompt, extra_messages)
 
         payload = {
@@ -66,9 +64,8 @@ class LLMClient:
             response = self.session.post(url, json=payload, timeout=self.timeout)
             response.raise_for_status()
         except requests.HTTPError as exc:
-            print("[LLMClient] HTTP error:", exc)
-            print("[LLMClient] Response text:", response.text)
             LOGGER.error("LLM request failed: %s", exc)
+            LOGGER.error("Response text: %s", getattr(exc.response, "text", ""))
             return None
         except requests.RequestException as exc:
             LOGGER.error("LLM request failed: %s", exc)
@@ -88,13 +85,12 @@ class LLMClient:
 
     @staticmethod
     def extract_json_block(raw_text: str) -> Optional[str]:
-        """Витягнути JSON-блок з відповіді LLM (з урахуванням ```json ... ``` або просто {...})."""
+        """Витягнути JSON-блок з відповіді LLM (```json ... ``` або просто {...})."""
         if raw_text is None:
             return None
 
         raw = raw_text.strip()
 
-        # 1) Спочатку шукаємо fenced-блок ```json ... ```
         fenced_match = re.search(
             r"```json\s*(\{.*?\})\s*```",
             raw,
@@ -103,7 +99,6 @@ class LLMClient:
         if fenced_match:
             return fenced_match.group(1).strip()
 
-        # 2) Потім просто ``` ... ``` з JSON всередині
         fenced_match = re.search(
             r"```\s*(\{.*?\})\s*```",
             raw,
@@ -112,7 +107,6 @@ class LLMClient:
         if fenced_match:
             return fenced_match.group(1).strip()
 
-        # 3) Фолбек: перший JSON-блок {...} у всьому тексті
         m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
         if m:
             return m.group(0).strip()

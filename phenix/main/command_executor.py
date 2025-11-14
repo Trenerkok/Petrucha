@@ -1,4 +1,3 @@
-"""Structured command executor that bridges NLU output with legacy actions."""
 from __future__ import annotations
 import random
 import logging
@@ -48,9 +47,9 @@ class CommandExecutor:
         device_type = command.get("device_type")
         if device_type in {"lamp", "group"}:
             self._legacy_execute("lamp", "")
-            notes = command.get("notes")
-            if notes:
-                self._speak(notes)
+            answer = command.get("answer_uk")
+            if answer:
+                self._speak(answer)
             return True
         if device_type == "system" and command.get("device_name") == "комп'ютер":
             self._speak("Комп'ютер уже увімкнений.")
@@ -62,9 +61,9 @@ class CommandExecutor:
         device_type = command.get("device_type")
         if device_type in {"lamp", "group"}:
             self._legacy_execute("lamp_off", "")
-            notes = command.get("notes")
-            if notes:
-                self._speak(notes)
+            answer = command.get("answer_uk")
+            if answer:
+                self._speak(answer)
             return True
         if device_type == "system" and command.get("device_name") == "комп'ютер":
             self._legacy_execute("power_off", "")
@@ -112,10 +111,10 @@ class CommandExecutor:
 
     def _handle_ask_clarification(self, command: dict) -> bool:
         """Коли моделі бракує одного важливого параметра."""
-        answer = command.get("answer_uk")
-        if not answer:
-            answer = "Я не до кінця зрозумів. Спробуй, будь ласка, сказати це інакше або уточнити деталі."
-        self._speak(answer)
+        message = command.get("notes") or command.get("answer_uk")
+        if not message:
+            message = "Я не до кінця зрозумів. Спробуй, будь ласка, сказати це інакше або уточнити деталі."
+        self._speak(message)
         return True
 
     def _handle_activate_scene(self, command: dict) -> bool:
@@ -128,10 +127,7 @@ class CommandExecutor:
 
     def _handle_smalltalk(self, command: dict) -> bool:
         """Невимушена розмова / привітання."""
-        # Спочатку беремо спеціальне поле для відповіді користувачу
         answer = command.get("answer_uk")
-
-        # Якщо модель не дала answer_uk – fallback на свої шаблони
         if not answer:
             canned = [
                 "Все нормально, працюю і слухаю тебе. А як ти?",
@@ -140,13 +136,7 @@ class CommandExecutor:
                 "Та живу собі в залізі, все стабільно.",
             ]
             answer = random.choice(canned)
-
         self._speak(answer)
-        return True
-
-    def _handle_ask_clarification(self, command: dict) -> bool:
-        message = command.get("notes") or "Потрібно уточнення. Повторіть, будь ласка."
-        self._speak(message)
         return True
 
     def _handle_unknown(self, command: dict) -> bool:

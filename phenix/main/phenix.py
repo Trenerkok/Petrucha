@@ -1,10 +1,10 @@
 import os
 import json
-import queue
 import logging  # BEGIN NLU MOD
 import sounddevice as sd
-import vosk
 import threading
+import numpy as np
+import whisper
 from datetime import datetime
 import random
 import sys
@@ -20,12 +20,17 @@ from selenium.webdriver.chrome.options import Options
 import serial
 import re
 from gtts import gTTS
+from typing import Optional
 
 # BEGIN NLU MOD
 from command_executor import CommandExecutor
 from llm_client import LLMClient
 from nlu_interpreter import NLUInterpreter
 # END NLU MOD
+
+# BEGIN VAD MOD
+from vad_recorder import VADUtteranceRecorder
+# END VAD MOD
 
 # ----------------
 # --- Опції ---
@@ -78,15 +83,13 @@ opts = {
     }
 }
 # --- ваші девайси ---
-arduino = serial.Serial('COM3', 9600)
-time.sleep(2)
+#arduino = serial.Serial('COM3', 9600)
+#time.sleep(2)
 
-# --- vosk ---
-model_path = "uk_v3/model"
 samplerate = 16000
-model = vosk.Model(model_path)
-rec = vosk.KaldiRecognizer(model, samplerate)
-q = queue.Queue()
+# "small" – нормальний баланс якості/швидкості для української,
+# "medium" – ще краще, якщо тягне залізо (у тебе RTX 3070 – тягне).
+whisper_model = whisper.load_model("small")  # або "medium"
 
 # --- tts init ---
 mixer.init()
@@ -99,11 +102,16 @@ logging.basicConfig(
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_LLM_BASE_URL = "http://127.0.0.1:1234"
-DEFAULT_LLM_MODEL = "Phi-3.5-mini-instruct"
+DEFAULT_LLM_MODEL = "phi-3.5-mini-instruct"
 
-nlu_interpreter = None
-structured_executor = None
+nlu_interpreter: Optional[NLUInterpreter] = None
+structured_executor: Optional[CommandExecutor] = None
 # END NLU MOD
+
+# BEGIN VAD MOD
+vad_recorder: Optional[VADUtteranceRecorder] = None
+# END VAD MOD
+
 
 def speak(text):
     print(f"[TTS] {text}")
@@ -123,6 +131,78 @@ def speak(text):
     except Exception as e:
         print(f"[Помилка TTS] {e}")
 
+
+# === VAD-версія запису фрази ===
+def record_phrase(seconds: float = 4.0) -> np.ndarray:
+    """
+    Записати одну фразу з мікрофона за допомогою VAD.
+    Параметр seconds залишено для сумісності, але фактично не використовується:
+    довжина фрази визначається VAD.
+    """
+    global vad_recorder
+    if vad_recorder is None:
+        vad_recorder = VADUtteranceRecorder(
+            samplerate=samplerate,
+            block_duration=0.1,        # 100 мс блок
+            energy_threshold=0.02,     # поріг гучності, потім можна підібрати
+            min_voice_blocks=3,
+            max_silence_blocks=7,
+            max_utterance_duration=10.0,
+        )
+
+    print("[AUDIO/VAD] Очікую на фразу...")
+    audio = vad_recorder.record_utterance()
+
+    if audio.size > 0:
+        print(
+            f"[AUDIO/VAD] Отримано {audio.shape[0]} семплів, "
+            f"max={float(np.max(np.abs(audio))):.4f}"
+        )
+    else:
+        print("[AUDIO/VAD] Фразу не зафіксовано.")
+
+    return audio
+
+
+def transcribe_whisper(audio: np.ndarray) -> str:
+    """Розпізнати українську фразу через Whisper."""
+    if audio is None or audio.size == 0:
+        print("[Whisper] Порожнє аудіо, пропускаю транскрипцію.")
+        return ""
+
+    # 1) Гарантуємо 1D mono float32
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    audio = audio.astype(np.float32)
+
+    # 2) Порог по гучності — якщо майже тиша, не ганяємо Whisper
+    max_val = np.max(np.abs(audio)) if audio.size > 0 else 0.0
+    if max_val < 0.02:
+        print(f"[Whisper] Дуже тихий сигнал (max={max_val:.4f}), пропускаю.")
+        return ""
+
+    # 3) Нормалізація амплітуди до [-1, 1]
+    audio = audio / max_val
+    print(f"[Whisper] Audio shape={audio.shape}, max={max_val:.4f}")
+
+    try:
+        result = whisper_model.transcribe(
+            audio,
+            language="uk",        # фіксуємо українську
+            task="transcribe",    # НЕ translate → просто розпізнання
+            fp16=False,           # для CPU; якщо точно GPU+fp16 – можна True
+            temperature=0.0,      # менше «галюцинацій»
+            verbose=False,
+        )
+    except Exception as e:
+        print(f"[Whisper] Помилка розпізнавання: {e}")
+        return ""
+
+    text = (result.get("text") or "").strip()
+    print(f"[Whisper] Розпізнано: {text}")
+    return text.lower()
+
+
 def match_commands(text):
     """Повертає всі команди, що зустрілися у фразі, разом із відповідною частиною тексту."""
     found_cmds = []
@@ -141,6 +221,7 @@ def match_commands(text):
                 found_cmds.append((cmd, phrase))
     return found_cmds, text
 
+
 def extract_number(text):
     """Шукає перше число або словесне представлення числа в тексті."""
     nums = re.findall(r'\d+', text)
@@ -155,6 +236,7 @@ def extract_number(text):
         if word in text:
             return val
     return None
+
 
 def execute_cmd(cmd, voice=None):
     keyboard = Controller()
@@ -219,15 +301,15 @@ def execute_cmd(cmd, voice=None):
             print(f"[LLM TEST] Connection FAILED: {exc}")
             speak("Я не можу підключитися до мовної моделі.")
 
-    elif cmd == "servo":
-        arduino.write(b'1')
-        print("Команда відправлена!")
-    elif cmd == "lamp":
-        arduino.write(b'2')
-        print("comand succes")
-    elif cmd == "lamp_off":
-        arduino.write(b'3')
-        print("off")
+#    elif cmd == "servo":
+#        arduino.write(b'1')
+#        print("Команда відправлена!")
+#    elif cmd == "lamp":
+#        arduino.write(b'2')
+#        print("comand succes")
+#    elif cmd == "lamp_off":
+#        arduino.write(b'3')
+#        print("off")
 
     elif cmd == "google":
         if voice:
@@ -293,13 +375,72 @@ def execute_cmd(cmd, voice=None):
     elif cmd == 'coin':
         if random.randint(1,2) == 1:
             speak("Випав герб")
-        else :
+        else:
             speak('Випала Копійка')
 
-def audio_callback(indata, frames, time_info, status):
-    if status:
-        print(status)
-    q.put(bytes(indata))
+
+def listen_for_phrase(prompt: str = "Скажи фразу", seconds: float = 4.0) -> str:
+    """
+    Прослухати одну фразу.
+    VAD сам вирішує, коли почати/закінчити запис;
+    seconds залишено для сумісності, але фактично не використовується.
+    """
+    print(prompt)
+    audio = record_phrase(seconds=seconds)
+    if audio is None or audio.size == 0:
+        return ""
+    text = transcribe_whisper(audio)
+    return text
+
+
+def main_loop():
+    print("Система уважно слухає… Скажи щось, що містить 'Петро' або інше звернення.")
+
+    while True:
+        # 1. Слухаємо загальну фразу (тепер довжина визначається VAD)
+        text = listen_for_phrase("Слухаю фон...", seconds=4.0)
+        if not text:
+            continue
+
+        if wait_for_alias(text):
+            print(f"Активація: звернулись як '{text}'")
+            speak("Я слухаю тебе.")
+
+            # 2. Тепер окремо слухаємо саму команду (теж через VAD)
+            cmd_text = listen_for_phrase("Слухаю команду...", seconds=4.0)
+            if not cmd_text:
+                speak("Я нічого не почув, повтори, будь ласка.")
+                continue
+
+            print(f"Отримано команду: {cmd_text}")
+            cmds, extra = match_commands(cmd_text)
+
+            if cmds:
+                for cmd, _ in cmds:
+                    execute_cmd(cmd, extra)
+                    if cmd in ["stop_petro", "close_petro"]:
+                        speak("Повертаюсь у режим очікування.")
+                        return
+            else:
+                # NLU / LLM
+                LOGGER.info("Rule-based parser не знайшов команд. Використовую NLU для: %s", cmd_text)
+                if nlu_interpreter and structured_executor:
+                    try:
+                        structured_cmds = nlu_interpreter.interpret(cmd_text)
+                    except Exception as exc:
+                        LOGGER.error("[NLU] Error during LLM call: %s", exc)
+                        structured_cmds = []
+
+                    if not structured_cmds:
+                        speak("Я не зрозумів команду, повтори, будь ласка.")
+                    else:
+                        for structured_cmd in structured_cmds:
+                            handled = structured_executor.execute(structured_cmd)
+                            if not handled:
+                                speak("Поки що не можу виконати цю команду.")
+                else:
+                    speak("Я не зрозумів команду, повтори, будь ласка.")
+
 
 def wait_for_alias(text):
     """Розпізнавання alias для активації."""
@@ -308,61 +449,11 @@ def wait_for_alias(text):
             return True
     return False
 
-def voice_mode():
-    print("Система уважно слухає… Скажіть 'Петро' чи інше звернення для активації.")
-    while True:
-        data = q.get()
-        if rec.AcceptWaveform(data):
-            result = json.loads(rec.Result())
-            text = result.get("text", "")
-            if text:
-                if wait_for_alias(text):
-                    print(f"Активація: звернулись як '{text}'")
-                    speak("Я слухаю тебе.")
-                    command_mode()
-                else:
-                    print(f"Ігнор — розпізнано '{text}'")
-
-def command_mode():
-    """Петро виконує всі розпізнані команди у реченні."""
-    while True:
-        data = q.get()
-        if rec.AcceptWaveform(data):
-            result = json.loads(rec.Result())
-            text = result.get("text", "")
-            if text:
-                print(f"Отримано фразу: {text}")
-                cmds, extra = match_commands(text)
-                if cmds:
-                    for cmd, _ in cmds:
-                        execute_cmd(cmd, extra)
-                        if cmd in ["stop_petro", "close_petro"]:
-                            speak("Повертаюсь у режим очікування.")
-                            return
-                else:
-                    # BEGIN NLU MOD
-                    LOGGER.info("Rule-based parser не знайшов команд. Використовую NLU для: %s", text)
-                    if nlu_interpreter and structured_executor:
-                        try:
-                            structured_cmds = nlu_interpreter.interpret(text)
-                        except Exception as exc:  # pragma: no cover
-                            LOGGER.error("[NLU] Error during LLM call, falling back to rule-based only: %s", exc)
-                            structured_cmds = []
-                        if not structured_cmds:
-                            speak("Я не зрозумів команду, повтори, будь ласка.")
-                        else:
-                            for structured_cmd in structured_cmds:
-                                handled = structured_executor.execute(structured_cmd)
-                                if not handled:
-                                    speak("Поки що не можу виконати цю команду.")
-                    else:
-                        speak("Я не зрозумів команду, повтори, будь ласка.")
-                    # END NLU MOD
-
 
 def main():
-    # BEGIN NLU MOD
     global nlu_interpreter, structured_executor
+
+    # 1. Ініціалізація NLU/LLM
     if nlu_interpreter is None:
         try:
             base_url = os.environ.get("LLM_BASE_URL", DEFAULT_LLM_BASE_URL)
@@ -373,16 +464,17 @@ def main():
                 model=model,
             )
             nlu_interpreter = NLUInterpreter(llm_client)
-        except Exception as exc:  # pragma: no cover
+        except Exception as exc:
             LOGGER.error("Не вдалося ініціалізувати NLU: %s", exc)
             nlu_interpreter = None
+
     if structured_executor is None:
         structured_executor = CommandExecutor(speak, execute_cmd)
-    # END NLU MOD
-    threading.Thread(target=voice_mode, daemon=True).start()
-    with sd.RawInputStream(samplerate=samplerate, dtype='int16', channels=1, callback=audio_callback):
-        while True:
-            sd.sleep(1000)
+
+    # 2. Основний цикл з Whisper + VAD
+    print("[MAIN] Старт основного циклу")
+    main_loop()
+
 
 if __name__ == "__main__":
     main()

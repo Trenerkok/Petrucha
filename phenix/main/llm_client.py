@@ -1,11 +1,9 @@
 """Client for interacting with a local LM Studio HTTP endpoint."""
 from __future__ import annotations
-
 import json
 import logging
 import re
 from typing import Iterable, Optional
-
 import requests
 
 LOGGER = logging.getLogger(__name__)
@@ -49,58 +47,78 @@ class LLMClient:
     def complete(
         self,
         system_prompt: str,
-        user_message: str,
+        user_prompt: str,
         extra_messages: Optional[Iterable[dict]] = None,
     ) -> Optional[str]:
         """Send a chat completion request and return the raw string content."""
-        messages = self._build_messages(system_prompt, user_message, extra_messages)
+        
+        messages = self._build_messages(system_prompt, user_prompt, extra_messages)
+
         payload = {
             "model": self.model,
             "messages": messages,
             "temperature": 0.2,
-            "response_format": {"type": "json_object"},
         }
+
         url = f"{self.base_url}/v1/chat/completions"
-        print("[LLMClient] Sending request to", self.base_url)
+
         try:
             response = self.session.post(url, json=payload, timeout=self.timeout)
             response.raise_for_status()
+        except requests.HTTPError as exc:
+            print("[LLMClient] HTTP error:", exc)
+            print("[LLMClient] Response text:", response.text)
+            LOGGER.error("LLM request failed: %s", exc)
+            return None
         except requests.RequestException as exc:
             LOGGER.error("LLM request failed: %s", exc)
             return None
 
-        print("[LLMClient] HTTP status:", response.status_code)
-        print("[LLMClient] Raw content (truncated):", response.text[:200])
-
         try:
             data = response.json()
         except json.JSONDecodeError as exc:
-            LOGGER.error("Invalid JSON from LLM response body: %s", exc)
+            LOGGER.error("Invalid JSON in LLM response body: %s", exc)
             return None
 
         try:
-            content = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            LOGGER.error("Unexpected LLM response structure: %s", exc)
+            return data["choices"][0]["message"]["content"]
+        except Exception as exc:
+            LOGGER.error("Unexpected LLM format: %s", exc)
             return None
-
-        if content is None:
-            return None
-        return str(content)
 
     @staticmethod
     def extract_json_block(raw_text: str) -> Optional[str]:
-        """Remove markdown code fences and return the JSON substring."""
+        """Витягнути JSON-блок з відповіді LLM (з урахуванням ```json ... ``` або просто {...})."""
         if raw_text is None:
             return None
-        # Strip common Markdown fences
-        fenced_match = re.search(r"```json\s*(.*?)\s*```", raw_text, re.DOTALL | re.IGNORECASE)
+
+        raw = raw_text.strip()
+
+        # 1) Спочатку шукаємо fenced-блок ```json ... ```
+        fenced_match = re.search(
+            r"```json\s*(\{.*?\})\s*```",
+            raw,
+            re.DOTALL | re.IGNORECASE,
+        )
         if fenced_match:
             return fenced_match.group(1).strip()
-        fenced_match = re.search(r"```\s*(.*?)\s*```", raw_text, re.DOTALL)
+
+        # 2) Потім просто ``` ... ``` з JSON всередині
+        fenced_match = re.search(
+            r"```\s*(\{.*?\})\s*```",
+            raw,
+            re.DOTALL,
+        )
         if fenced_match:
             return fenced_match.group(1).strip()
-        return raw_text.strip() if raw_text else None
+
+        # 3) Фолбек: перший JSON-блок {...} у всьому тексті
+        m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if m:
+            return m.group(0).strip()
+
+        LOGGER.error("LLM output has no JSON block: %r", raw)
+        return None
 
     def request_json(
         self,

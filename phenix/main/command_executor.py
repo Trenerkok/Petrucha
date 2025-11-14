@@ -1,6 +1,6 @@
 """Structured command executor that bridges NLU output with legacy actions."""
 from __future__ import annotations
-
+import random
 import logging
 from typing import Callable, Optional
 
@@ -110,12 +110,12 @@ class CommandExecutor:
         self._speak(f"Запам'ятав режим {mode}, але поки не можу його встановити.")
         return True
 
-    def _handle_ask_status(self, command: dict) -> bool:
-        target = command.get("device_name") or command.get("group_name") or command.get("device_type")
-        if target:
-            self._speak(f"Поки що не маю даних про стан '{target}'.")
-        else:
-            self._speak("Поки що не маю даних про стан системи.")
+    def _handle_ask_clarification(self, command: dict) -> bool:
+        """Коли моделі бракує одного важливого параметра."""
+        answer = command.get("answer_uk")
+        if not answer:
+            answer = "Я не до кінця зрозумів. Спробуй, будь ласка, сказати це інакше або уточнити деталі."
+        self._speak(answer)
         return True
 
     def _handle_activate_scene(self, command: dict) -> bool:
@@ -127,8 +127,21 @@ class CommandExecutor:
         return True
 
     def _handle_smalltalk(self, command: dict) -> bool:
-        message = command.get("notes") or "Радий спілкуванню!"
-        self._speak(message)
+        """Невимушена розмова / привітання."""
+        # Спочатку беремо спеціальне поле для відповіді користувачу
+        answer = command.get("answer_uk")
+
+        # Якщо модель не дала answer_uk – fallback на свої шаблони
+        if not answer:
+            canned = [
+                "Все нормально, працюю і слухаю тебе. А як ти?",
+                "Потихеньку, головне, що ти мене не вимикаєш.",
+                "Нормально, стежу за тим, що ти робиш.",
+                "Та живу собі в залізі, все стабільно.",
+            ]
+            answer = random.choice(canned)
+
+        self._speak(answer)
         return True
 
     def _handle_ask_clarification(self, command: dict) -> bool:
@@ -137,8 +150,11 @@ class CommandExecutor:
         return True
 
     def _handle_unknown(self, command: dict) -> bool:
-        message = command.get("notes") or "Я не зрозумів команду."
-        self._speak(message)
+        """Коли взагалі незрозуміло, що від користувача потрібно."""
+        answer = command.get("answer_uk")
+        if not answer:
+            answer = "Я не зрозумів, що ти маєш на увазі. Можеш переформулювати простішими словами?"
+        self._speak(answer)
         return True
 
     # --- Helpers ---------------------------------------------------------

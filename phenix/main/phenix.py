@@ -5,11 +5,13 @@ import queue
 import platform
 import subprocess
 import glob
+import logging
+import threading
+import urllib.parse
 from datetime import datetime
 import random
 import time
 import webbrowser
-
 import sounddevice as sd
 import vosk
 from pygame import mixer
@@ -22,9 +24,27 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from gtts import gTTS
 import paramiko
-from thefuzz import fuzz, process  # для safety-layer команд
+from thefuzz import fuzz, process  # для fuzzy-команд
 
-# ---------------------- Завантаження конфігурації ----------------------
+from ui import start_ui, ui_add_message, ui_set_status
+
+# ===================== ЛОГИ =====================
+
+LOG_DIR = "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+log_path = os.path.join(LOG_DIR, "petro.log")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler(log_path, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+LOGGER = logging.getLogger("petro")
+
+# ===================== КОНФІГ =====================
 
 CONFIG_PATH = "petro_config.json"
 
@@ -34,9 +54,11 @@ def load_config(path: str) -> dict:
         raise RuntimeError(f"Не знайдено файл конфігурації: {path}")
     with open(path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
+
     for key in ["alias", "tbr", "commands"]:
         if key not in cfg:
             raise RuntimeError(f"В конфігу немає обов'язкового ключа: {key}")
+
     return cfg
 
 
@@ -44,17 +66,18 @@ CONFIG = load_config(CONFIG_PATH)
 
 ALIASES = CONFIG["alias"]
 TBR = CONFIG["tbr"]
-COMMANDS = CONFIG["commands"]
+COMMANDS = CONFIG["commands"]          # словник {cmd_code: [frazy...]}
 
+APPS_MAP = CONFIG.get("apps", {})      # {"steam": "C:/...", "telegram": "C:/..."}
 LLM_BASE_URL = CONFIG.get("llm_base_url", "http://127.0.0.1:1234")
 LLM_MODEL = CONFIG.get("llm_model", "phi-3.5-mini-instruct")
 GEMINI_MODEL = CONFIG.get("gemini_model", "gemini-2.5-flash")
 LLM_BACKEND = CONFIG.get("llm_backend_default", "local").lower()
 
-# небезпечні команди – ТІЛЬКИ точний збіг, без fuzz
+# небезпечні команди (тільки точний матч + підтвердження)
 DANGEROUS_COMMANDS = {"power_off", "sleep", "server"}
 
-# ---------------------- ASR / Vosk ----------------------
+# ===================== ASR / Vosk =====================
 
 model_path = "uk_v3/model"
 samplerate = 16000
@@ -62,25 +85,36 @@ model = vosk.Model(model_path)
 rec = vosk.KaldiRecognizer(model, samplerate)
 q = queue.Queue()
 
-# ---------------------- Аудіо / TTS ----------------------
+# ===================== АУДІО / СТАН =====================
 
 mixer.init()
 keyboard = Controller()
 voice = ""  # остання фраза
 
-# новий глобальний прапор
-MUTED = False  # якщо True – Петруча не говорить вголос
+# глобальні прапори
+MUTED = False   # якщо True – Петруча не говорить вголос
+MIC_ON = True   # якщо False – ігноруємо мікрофон
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# Додаємо підтримку ключа з config:
+GEMINI_API_KEY = CONFIG.get("gemini_api_key") or os.getenv("GEMINI_API_KEY")
+
+# стан підтвердження небезпечних дій
+PENDING_CONFIRM = None
+# формат: {"type": "power_off"|"sleep"|..., "data": {...}}
 
 
-def speak(text: str):
+# ===================== TTS =====================
+
+def speak(text: str, to_ui: bool = True) -> None:
+    """Озвучити текст (або тільки залогувати, якщо MUTED)."""
     global MUTED
 
-    # завжди лог у консоль
+    msg = f"Петруча: {text}"
+    LOGGER.info(msg)
     print(f"[TTS] {text}")
+    if to_ui:
+        ui_add_message("assistant", text)
 
-    # якщо тихий режим – не відтворюємо звук
     if MUTED:
         return
 
@@ -98,12 +132,13 @@ def speak(text: str):
         mixer.music.unload()
         os.remove(filename)
     except Exception as e:
-        print(f"[Помилка TTS] {e}")
+        LOGGER.error("Помилка TTS: %s", e)
 
 
-# ---------------------- LLM backend-и ----------------------
+# ===================== LLM backend-и =====================
 
 def ask_llm_local(question: str) -> str:
+    """Запит до локальної LLM (LM Studio, сумісний з OpenAI API)."""
     try:
         url = f"{LLM_BASE_URL.rstrip('/')}/v1/chat/completions"
         payload = {
@@ -125,13 +160,14 @@ def ask_llm_local(question: str) -> str:
         data = resp.json()
         return data["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        print(f"[LLM/local] Помилка запиту: {e}")
+        LOGGER.error("[LLM/local] Помилка запиту: %s", e)
         return ""
 
 
 def ask_gemini(question: str) -> str:
+    """Звичайна відповідь від Gemini у форматі тексту."""
     if not GEMINI_API_KEY:
-        print("[Gemini] GEMINI_API_KEY не заданий")
+        LOGGER.warning("GEMINI_API_KEY не заданий")
         return ""
 
     try:
@@ -166,13 +202,69 @@ def ask_gemini(question: str) -> str:
         data = resp.json()
         return data["candidates"][0]["content"]["parts"][0]["text"].strip()
     except Exception as e:
-        print(f"[Gemini] Помилка запиту: {e}")
+        LOGGER.error("[Gemini] Помилка запиту: %s", e)
         return ""
 
 
+def ask_gemini_url(query: str) -> str | None:
+    """
+    Спеціальний запит до Gemini: повернути тільки URL сайту,
+    який найкраще відповідає запиту користувача.
+    """
+    if not GEMINI_API_KEY:
+        return None
+
+    try:
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{GEMINI_MODEL}:generateContent"
+        )
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_API_KEY,
+        }
+        body = {
+            "systemInstruction": {
+                "parts": [
+                    {
+                        "text": (
+                            "Ти помічник, який повертає лише один URL сайту. "
+                            "Користувач дає опис або назву сервісу. "
+                            "Поверни ТІЛЬКИ одну коректну https-URL-адресу, "
+                            "без пояснень, тексту чи форматування."
+                        )
+                    }
+                ]
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": query}],
+                }
+            ],
+        }
+        resp = requests.post(url, headers=headers, json=body, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        for token in text.split():
+            if token.startswith("http://") or token.startswith("https://"):
+                return token
+        return None
+    except Exception as e:
+        LOGGER.error("[Gemini URL] Помилка запиту: %s", e)
+        return None
+
+
 def ask_smart(question: str) -> str:
+    """
+    Високоуровневий вибір backend'а:
+    - off   → нічого не робимо;
+    - gemini→ Gemini з fallback на локальну;
+    - local → тільки локальна.
+    """
     backend = LLM_BACKEND
-    print(f"[LLM] Режим: {backend}, питання: {question!r}")
+    LOGGER.info("[LLM] Режим: %s, питання: %r", backend, question)
 
     if backend == "off":
         return ""
@@ -181,35 +273,35 @@ def ask_smart(question: str) -> str:
         ans = ask_gemini(question)
         if ans:
             return ans
-        ans = ask_llm_local(question)
-        return ans
+        return ask_llm_local(question)
 
     # default local
-    ans = ask_llm_local(question)
-    return ans
+    return ask_llm_local(question)
 
 
-# ---------------------- Мануал ----------------------
+# ===================== МАНУАЛ =====================
 
 def print_manual():
     print("======================================")
     print("  Голосовий асистент Петруча")
-    print(" by Бартаков Максим і Самуць Назар")
+    print("  by Бартаков Максим і Самуць Назар")
     print("======================================")
     print("Базові можливості:")
     print("  - Годинник:        «петро котра година», «петруча поточний час»")
     print("  - Погода:         «петро яка погода», «погода»")
     print("  - Монетка:        «петро підкинь монетку»")
-    print("  - Пошук в Google: «петро загугли ...»")
-    print("  - Пошук в YouTube:«петро увімкни відео ...»")
+    print("  - Пошук в Google: «петро загугли що таке дуб»")
+    print("  - Пошук в YouTube:«петро відкрий відео про котів на ютубі»")
+    print("  - LLM-відповіді:  «петро розкажи що таке дуб» (через LLM)")
     print("  - Гучність:       «петро збільшити гучність на 20» тощо")
     print("  - Вимкнення/сон:  «петро вимкни комп'ютер», «петро сон»")
     print("")
     print("Керування ПК:")
-    print("  - Телеграм:       «петро відкрий телеграм», «петро запусти телеграм»")
-    print("  - Браузер:        «петро відкрий браузер», «петро відкрий хром»")
-    print("  - Скріншот:       «петро зроби скріншот», «петро зроби скрін»")
-    print("  - Папки:          «петро відкрий завантаження», «відкрий документи», «відкрий робочий стіл»")
+    print("  - Телеграм:       «петро відкрий телеграм»")
+    print("  - Браузер:        «петро відкрий браузер»")
+    print("  - Стім:           «петро відкрий стім»")
+    print("  - Скріншот:       «петро зроби скріншот»")
+    print("  - Папки:          «петро відкрий завантаження / документи / робочий стіл»")
     print("  - Файли:          «петро знайди файл звіт», «знайди документ договор»")
     print("")
     print("Режими LLM:")
@@ -222,7 +314,7 @@ def print_manual():
     print("======================================")
 
 
-# ---------------------- Safety-layer: нормалізація ASR ----------------------
+# ===================== SAFETY NORMALIZATION =====================
 
 ARTIFACT_MAP = {
     # варіанти Gemini
@@ -231,18 +323,14 @@ ARTIFACT_MAP = {
     "гіміні": "джеміні",
     "хіміні": "джеміні",
     "жміні": "джеміні",
-    "жміні": "джеміні",
     "жиміні": "джеміні",
     "заміні": "джеміні",
     "заміни": "джеміні",
-    "замина": "джеміні",
     "заміна": "джеміні",
-    "замени": "джеміні",
-    "замінаи": "джеміні",
-    "gmini": "gemini",
     "zamini": "gemini",
+    "gmini": "gemini",
 
-    # варіанти імені асистента (якщо треба)
+    # варіанти імені асистента
     "петруха": "петруча",
     "пітруча": "петруча",
 }
@@ -250,23 +338,19 @@ ARTIFACT_MAP = {
 
 def normalize_asr_text(text: str) -> str:
     t = text.lower().strip()
-    # нормалізація пробілів
     t = " ".join(t.split())
-    # словникові заміни по словам
     words = t.split(" ")
-    norm_words = []
-    for w in words:
-        norm_words.append(ARTIFACT_MAP.get(w, w))
+    norm_words = [ARTIFACT_MAP.get(w, w) for w in words]
     return " ".join(norm_words)
 
 
-# ---------------------- Парсер команд з fuzz ----------------------
+# ===================== ПАРСЕР КОМАНД =====================
 
 def match_command(text: str):
     """
     Повертає (cmd, cleaned_text, has_alias):
     - cmd: код команди або None
-    - cleaned_text: текст без alias і службових слів
+    - cleaned_text: текст без alias і службових слів (для LLM / Google / YouTube)
     - has_alias: чи починалося висловлювання з імені асистента
     """
     original = normalize_asr_text(text)
@@ -279,26 +363,30 @@ def match_command(text: str):
         if cleaned.startswith(alias_l):
             has_alias = True
             cleaned = cleaned[len(alias_l):].strip()
-            # Прибираємо службові слова після alias
-            for tbr in TBR:
-                tbr_l = tbr.lower()
-                if cleaned.startswith(tbr_l):
-                    cleaned = cleaned[len(tbr_l):].strip()
             break
 
-    # 2. Спершу пробуємо точний пошук
+    cmd_search_text = cleaned
+
+    # 2. Прибираємо службові слова тільки з cleaned_text (НЕ з cmd_search_text)
+    for tbr in TBR:
+        tbr_l = tbr.lower()
+        if cleaned.startswith(tbr_l):
+            cleaned = cleaned[len(tbr_l):].strip()
+            break
+
+    # --------- 3. Точний пошук фраз команд ---------
     for cmd, phrases in COMMANDS.items():
         for phrase in phrases:
             phrase_l = phrase.lower()
-            if phrase_l and phrase_l in cleaned:
+            if phrase_l and phrase_l in cmd_search_text:
                 return cmd, cleaned, has_alias
 
-    # 3. Fuzzy-пошук (safety-layer), крім небезпечних команд
+    # --------- 4. Fuzzy-пошук (крім небезпечних команд) ---------
     variants = []
     mapping = {}
     for cmd, phrases in COMMANDS.items():
         if cmd in DANGEROUS_COMMANDS:
-            continue  # тільки точні збіги
+            continue
         for phrase in phrases:
             phrase_l = phrase.lower()
             if phrase_l:
@@ -307,23 +395,95 @@ def match_command(text: str):
 
     if variants:
         best_phrase, score = process.extractOne(
-            cleaned,
+            cmd_search_text,
             variants,
-            scorer=fuzz.token_set_ratio
+            scorer=fuzz.token_set_ratio,
         )
-        if score >= 80:  # поріг схожості
+        if score >= 80:
             cmd = mapping.get(best_phrase)
             if cmd:
-                print(f"[FUZZ] best='{best_phrase}', score={score}, cmd='{cmd}'")
+                LOGGER.info("[FUZZ] best='%s', score=%d, cmd='%s'", best_phrase, score, cmd)
                 return cmd, cleaned, has_alias
 
     return None, cleaned, has_alias
 
 
-# ---------------------- Виконання команд ----------------------
+# ===================== ДОПОМОЖНІ Ф-Ї =====================
 
-def execute_cmd(cmd: str):
-    global voice, LLM_BACKEND
+def extract_int_after_word(text: str, marker: str) -> int | None:
+    try:
+        idx = text.index(marker) + len(marker)
+        part = text[idx:].strip()
+        digits = "".join(ch for ch in part if ch.isdigit())
+        return int(digits) if digits else None
+    except ValueError:
+        return None
+
+
+def confirm_dangerous(action_type: str, description: str, data: dict | None = None):
+    """
+    Поставити запит на підтвердження небезпечної дії.
+    action_type: 'power_off' | 'sleep' | 'server' | ...
+    """
+    global PENDING_CONFIRM
+    PENDING_CONFIRM = {"type": action_type, "data": data or {}}
+    speak(description + " Скажи «підтверджую» або «відміна».")
+
+
+def handle_confirmation(cmd: str):
+    """
+    Обробка команд підтвердження / відміни для PENDING_CONFIRM.
+    cmd: 'confirm' | 'cancel'
+    """
+    global PENDING_CONFIRM
+    if not PENDING_CONFIRM:
+        speak("Немає небезпечної дії, яку треба підтвердити.")
+        return
+
+    if cmd == "cancel":
+        PENDING_CONFIRM = None
+        speak("Добре, відміняю дію.")
+        return
+
+    if cmd == "confirm":
+        action = PENDING_CONFIRM
+        PENDING_CONFIRM = None
+        t = action["type"]
+        data = action.get("data", {})
+        system = platform.system().lower()
+
+        if t == "power_off":
+            speak("Вимикаю комп'ютер.")
+            if system.startswith("win"):
+                os.system("shutdown /s /t 0")
+            else:
+                os.system("systemctl poweroff")
+
+        elif t == "sleep":
+            speak("Переводжу комп'ютер у сон.")
+            if system.startswith("win"):
+                os.system("rundll32.exe powrprof.dll,SetSuspendState 0,1,0")
+            else:
+                os.system("systemctl suspend")
+
+        elif t == "server":
+            speak("Запускаю небезпечну команду на сервері.")
+            # тут можна викликати ssh-логіку, якщо потрібно
+        else:
+            speak("Я не знаю, як виконати цю дію після підтвердження.")
+
+
+# ===================== ВИКОНАННЯ КОМАНД =====================
+
+def execute_cmd(cmd: str, cleaned_text: str | None = None) -> None:
+    global voice, LLM_BACKEND, MUTED
+
+    system = platform.system().lower()
+
+    # підтвердження / відміна
+    if cmd in {"confirm", "cancel"}:
+        handle_confirmation(cmd)
+        return
 
     # --- базові команди ---
     if cmd == "ctime":
@@ -331,198 +491,138 @@ def execute_cmd(cmd: str):
         speak(f"Поточний час {now}")
 
     elif cmd == "mute_on":
-        global MUTED
         MUTED = True
-        try:
-            if mixer.music.get_busy():
-                mixer.music.stop()
-                mixer.music.unload()
-        except Exception:
-            pass
-        print("[MUTE] Тихий режим увімкнено.")
-        # speak("Добре, буду мовчати.")  # якщо хочеш без голосу – закоментуй
+        ui_set_status(muted=True)
+        LOGGER.info("[MUTE] Тихий режим увімкнено.")
 
     elif cmd == "mute_off":
         MUTED = False
-        print("[MUTE] Тихий режим вимкнено.")
+        ui_set_status(muted=False)
         speak("Повернув голос, знову можу говорити.")
-
 
     elif cmd == "pogoda":
         speak("Перевіряю погоду...")
-        chrome_options = Options()
-        chrome_options.add_argument("--headless")
-        driver = webdriver.Chrome(options=chrome_options)
-        driver.get("https://meteofor.com.ua/weather-volodymyr-4927/now/")
-        html = driver.page_source
+        try:
+            chrome_options = Options()
+            chrome_options.add_argument("--headless")
+            driver = webdriver.Chrome(options=chrome_options)
+            driver.get("https://meteofor.com.ua/weather-volodymyr-4927/now/")
+            html = driver.page_source
 
-        speak(f"станом на {datetime.now().strftime('%H:%M')}")
+            speak(f"Станом на {datetime.now().strftime('%H:%M')}")
 
-        soup = BeautifulSoup(html, "html.parser")
-        divs = soup.find_all("div", class_="now-desc")
-        titles = soup.find_all("div", class_="now-feel")
-        temp = soup.find_all("div", class_="now-weather")
+            soup = BeautifulSoup(html, "html.parser")
+            desc = soup.find("div", class_="now-desc")
+            temp = soup.find("div", class_="now-weather")
+            feel = soup.find("div", class_="now-feel")
 
-        if divs:
-            speak("зараз у місті Володимир")
-            speak(divs[0].get_text())
-        if temp:
-            speak("температура")
-            speak(temp[0].get_text())
-        if titles:
-            speak(titles[0].get_text())
-        driver.quit()
+            speak("Зараз у місті Володимир.")
+            if desc:
+                speak(desc.get_text())
+            if temp:
+                speak("Температура " + temp.get_text())
+            if feel:
+                speak(feel.get_text())
+        except Exception as e:
+            LOGGER.error("Помилка при отриманні погоди: %s", e)
+            speak("Не вдалося отримати погоду.")
+        finally:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
     elif cmd == "server":
-        HOST = "192.168.1.104"
-        PORT = 22
-        USERNAME = "madarog"
-        PASSWORD = "pt123pt321"
-        SU_PASSWORD = "123456"
-
-        def ssh_interactive_su_command(cmd_line: str):
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            try:
-                client.connect(HOST, port=PORT, username=USERNAME, password=PASSWORD, timeout=10)
-            except Exception as e:
-                print("Connect failed:", e)
-                return
-
-            channel = client.invoke_shell()
-            time.sleep(1)
-            while channel.recv_ready():
-                print(channel.recv(1024).decode(errors="ignore"), end="")
-
-            channel.send("su\n")
-            time.sleep(1)
-
-            if channel.recv_ready():
-                output = channel.recv(1024).decode(errors="ignore")
-                print(output, end="")
-                if "Password:" in output or "password:" in output:
-                    channel.send(SU_PASSWORD + "\n")
-
-            time.sleep(1)
-            while channel.recv_ready():
-                print(channel.recv(1024).decode(errors="ignore"), end="")
-
-            print(f"Executing as su: {cmd_line}")
-            channel.send(cmd_line + "\n")
-
-            time.sleep(2)
-            while channel.recv_ready():
-                output = channel.recv(1024).decode(errors="ignore")
-                print(output, end="")
-
-            channel.close()
-            client.close()
-
-        ssh_interactive_su_command("systemctl reboot -i")
+        confirm_dangerous("server", "Ти хочеш виконати небезпечну команду на сервері.")
 
     elif cmd == "Hello":
-        speak("Привіт, я уважно тебе слухаю")
+        speak("Привіт, я уважно тебе слухаю.")
 
     elif cmd == "youtube":
-        new_voice = voice.lower()
-        try:
-            for _ in range(2):
-                new_voice = new_voice[: new_voice.index(" ")] + new_voice[new_voice.index(" ") + 1 :]
-            new_voice = new_voice[new_voice.index(" ") :]
-            plus_voice = new_voice.replace(" ", "+")[1:]
-            url = "https://www.youtube.com/results?search_query=" + plus_voice
-            webbrowser.open(url)
-            speak("Ось відео, які вдалось знайти по даному запиту в ютуб")
-        except ValueError:
-            speak("Не можу розібрати запит для ютуба.")
+        query = (cleaned_text or voice).strip()
+        if not query:
+            speak("Скажи, яке відео тебе цікавить.")
+            return
+        url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(query)
+        webbrowser.open(url)
+        speak("Відкрив результати пошуку на ютубі.")
 
     elif cmd == "google":
-        new_voice = voice.lower()
-        try:
-            for _ in range(2):
-                new_voice = new_voice[: new_voice.index(" ")] + new_voice[new_voice.index(" ") + 1 :]
-            new_voice = new_voice[new_voice.index(" ") :]
-            plus_voice = new_voice.replace(" ", "+")[1:]
-            url = "https://www.google.com/search?q=" + plus_voice
-            webbrowser.open(url)
-            speak("Ось дані, які вдалось знайти по даному запиту у гугл")
-        except ValueError:
-            speak("Не можу розібрати запит для гугл.")
+        query = (cleaned_text or voice).strip()
+        if not query:
+            speak("Сформулюй, будь ласка, що саме загуглити.")
+            return
+        url = "https://www.google.com/search?q=" + urllib.parse.quote_plus(query)
+        webbrowser.open(url)
+        speak("Відкрив результати пошуку в гуглі.")
 
     elif cmd == "power_off":
-        speak("вимикаю комп'ютер")
-        os.system("shutdown now -h")
+        confirm_dangerous("power_off", "Ти хочеш вимкнути комп'ютер?")
 
     elif cmd == "sleep":
-        speak("ввожу комп'ютер у сон")
-        os.system("systemctl suspend")
+        confirm_dangerous("sleep", "Ти хочеш перевести комп'ютер у сон?")
 
     elif cmd == "volume_up":
-        random_voice = voice.lower()
-        try:
-            x_volumeup = int(random_voice[random_voice.index("на") + 3 :])
-            for _ in range(round(x_volumeup / 2)):
-                keyboard.press(Key.media_volume_up)
-                keyboard.release(Key.media_volume_up)
-        except (ValueError, IndexError):
+        num = extract_int_after_word(voice.lower(), "на")
+        if num is None:
             speak("Не можу знайти число для збільшення гучності.")
+            return
+        for _ in range(round(num / 2)):
+            keyboard.press(Key.media_volume_up)
+            keyboard.release(Key.media_volume_up)
 
     elif cmd == "volume_down":
-        random_voice = voice.lower()
-        try:
-            x_volumedown = int(random_voice[random_voice.index("на") + 3 :])
-            for _ in range(round(x_volumedown / 2)):
-                keyboard.press(Key.media_volume_down)
-                keyboard.release(Key.media_volume_down)
-        except (ValueError, IndexError):
+        num = extract_int_after_word(voice.lower(), "на")
+        if num is None:
             speak("Не можу знайти число для зменшення гучності.")
+            return
+        for _ in range(round(num / 2)):
+            keyboard.press(Key.media_volume_down)
+            keyboard.release(Key.media_volume_down)
 
     elif cmd == "set_volume":
-        random_voice = voice.lower()
-        try:
-            x_volumeset = int(random_voice[random_voice.index("на") + 3 :])
+        num = extract_int_after_word(voice.lower(), "на")
+        if num is None:
+            speak("Не можу знайти рівень гучності.")
+        else:
             for _ in range(100):
                 keyboard.press(Key.media_volume_down)
                 keyboard.release(Key.media_volume_down)
-            for _ in range(round(x_volumeset / 2)):
+            for _ in range(round(num / 2)):
                 keyboard.press(Key.media_volume_up)
                 keyboard.release(Key.media_volume_up)
-        except (ValueError, IndexError):
-            speak("Не можу знайти рівень гучності.")
 
     elif cmd == "close_petro":
-        speak("до нових зустрічей")
+        speak("До нових зустрічей.")
         os._exit(0)
 
     elif cmd == "random":
-        random_voice = voice.lower()
+        txt = voice.lower()
         try:
-            int1_part = random_voice[: random_voice.index(" до ")]
-            for _ in range(3):
-                int1_part = int1_part[: int1_part.index(" ")] + int1_part[int1_part.index(" ") + 1 :]
-            int1 = int(int1_part[int1_part.index(" ") + 1 :])
-
-            int2 = int(random_voice[random_voice.index("до") + 3 :])
-
-            random_integer = random.randint(int1, int2)
-            speak(f"випадкове число від {int1} до {int2}: {random_integer}")
-        except (ValueError, IndexError):
-            speak("Не можу розібрати числа для випадкового діапазону.")
+            parts = txt.split("від", 1)[1].strip()
+            left, right = parts.split("до", 1)
+            int1 = int("".join(ch for ch in left if ch.isdigit()))
+            int2 = int("".join(ch for ch in right if ch.isdigit()))
+            if int1 > int2:
+                int1, int2 = int2, int1
+            rv = random.randint(int1, int2)
+            speak(f"Випадкове число від {int1} до {int2}: {rv}")
+        except Exception:
+            speak("Не можу розібрати діапазон для випадкового числа.")
 
     elif cmd == "coin":
         if random.randint(1, 2) == 1:
-            speak("Випав герб")
+            speak("Випав герб.")
         else:
-            speak("Випала Копійка")
+            speak("Випала копійка.")
 
     elif cmd == "stop_petro":
-        speak("Перехожу в режим очікування")
-        pyautogui.hotkey("ctrl", "alt", "del")
-        speak("Вихід з режиму очікування")
+        speak("Переходжу в режим очікування. Просто не говори мені нічого певний час.")
 
     # --- режими LLM ---
     elif cmd == "llm_local":
         LLM_BACKEND = "local"
+        ui_set_status(llm_mode="local")
         speak("Перейшов у режим локальної моделі.")
 
     elif cmd == "llm_gemini":
@@ -530,60 +630,65 @@ def execute_cmd(cmd: str):
             speak("Ключ Gemini не налаштований, не можу підключитися до Джеміні.")
         else:
             LLM_BACKEND = "gemini"
+            ui_set_status(llm_mode="gemini")
             speak("Перейшов у режим Джеміні. Потрібен стабільний інтернет.")
 
     elif cmd == "llm_off":
         LLM_BACKEND = "off"
+        ui_set_status(llm_mode="off")
         speak("Вимикаю мовні моделі. Працюю в офлайн-режимі, тільки базові команди.")
 
     # --- help ---
     elif cmd == "help":
         speak(
             "Я вмію показувати час, погоду, підкидати монетку, шукати в гуглі та ютубі, "
-            "керувати гучністю, вимикати комп'ютер, керувати деякими програмами, "
-            "робити скріншоти та шукати файли. Також можу відповідати на питання "
-            "через локальну модель або Джеміні."
+            "керувати гучністю, відкривати деякі програми, робити скріншоти та шукати файли. "
+            "Також можу відповідати на питання через локальну модель або Джеміні."
         )
         print_manual()
 
-    # --- нові команди керування ПК ---
+    # --- керування ПК ---
 
     elif cmd == "open_telegram":
         speak("Відкриваю телеграм.")
         try:
-            if platform.system().lower().startswith("win"):
-                # варіанти шляхів, можна дописати свої
-                possible_paths = [
-                    os.path.join(os.getenv("LOCALAPPDATA", ""), "Telegram Desktop", "Telegram.exe"),
-                    os.path.join(os.getenv("PROGRAMFILES", ""), "Telegram Desktop", "Telegram.exe"),
-                    os.path.join(os.getenv("PROGRAMFILES(X86)", ""), "Telegram Desktop", "Telegram.exe"),
-                ]
-                started = False
-                for p in possible_paths:
-                    if p and os.path.exists(p):
-                        os.startfile(p)
-                        started = True
-                        break
-                if not started:
-                    # fallback
+            if system.startswith("win"):
+                exe = APPS_MAP.get("telegram")
+                if exe and os.path.exists(exe):
+                    os.startfile(exe)
+                else:
                     subprocess.Popen(["start", "telegram"], shell=True)
             else:
-                # Linux/macOS
                 try:
                     subprocess.Popen(["telegram-desktop"])
                 except FileNotFoundError:
                     subprocess.Popen(["telegram"])
         except Exception as e:
-            print(f"[open_telegram] помилка: {e}")
+            LOGGER.error("[open_telegram] помилка: %s", e)
             speak("Не вдалося відкрити телеграм.")
 
     elif cmd == "open_browser":
         speak("Відкриваю браузер.")
         try:
-            webbrowser.open("https://www.google.com")
+            url = "https://www.google.com"
+            webbrowser.open(url)
         except Exception as e:
-            print(f"[open_browser] помилка: {e}")
+            LOGGER.error("[open_browser] помилка: %s", e)
             speak("Не вдалося відкрити браузер.")
+
+    elif cmd == "open_steam":
+        speak("Відкриваю Стім.")
+        exe = APPS_MAP.get("steam")
+        try:
+            if system.startswith("win") and exe and os.path.exists(exe):
+                os.startfile(exe)
+            elif system.startswith("win"):
+                subprocess.Popen(["start", "steam"], shell=True)
+            else:
+                subprocess.Popen(["steam"])
+        except Exception as e:
+            LOGGER.error("[open_steam] помилка: %s", e)
+            speak("Не вдалося відкрити Стім.")
 
     elif cmd == "screenshot":
         speak("Роблю скріншот.")
@@ -592,38 +697,33 @@ def execute_cmd(cmd: str):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             home = os.path.expanduser("~")
             pictures = os.path.join(home, "Pictures")
-            if not os.path.isdir(pictures):
-                save_dir = os.getcwd()
-            else:
-                save_dir = pictures
+            save_dir = pictures if os.path.isdir(pictures) else os.getcwd()
             filename = os.path.join(save_dir, f"screenshot_{timestamp}.png")
             img.save(filename)
             speak("Скріншот збережено.")
-            print(f"[screenshot] saved to {filename}")
+            LOGGER.info("[screenshot] saved to %s", filename)
         except Exception as e:
-            print(f"[screenshot] помилка: {e}")
+            LOGGER.error("[screenshot] помилка: %s", e)
             speak("Не вдалося зробити скріншот.")
 
     elif cmd == "open_folder":
-        # дивимося, про яку папку йдеться за ключовими словами
         t = voice.lower()
         home = os.path.expanduser("~")
         path = None
 
-        if "завантаження" in t or "загрузки" in t or "завантажень" in t:
-            # Downloads / Завантаження
-            for name in ["Downloads", "Завантаження"]:
+        if any(x in t for x in ["завантаження", "завантажень", "загрузки", "загрузок", "download"]):
+            for name in ["Downloads", "Завантаження", "Загрузки"]:
                 p = os.path.join(home, name)
                 if os.path.isdir(p):
                     path = p
                     break
-        elif "документи" in t or "documents" in t:
+        elif any(x in t for x in ["документи", "документів", "documents"]):
             for name in ["Documents", "Документи"]:
                 p = os.path.join(home, name)
                 if os.path.isdir(p):
                     path = p
                     break
-        elif "робочий стіл" in t or "робочому столі" in t or "desktop" in t:
+        elif any(x in t for x in ["робочий стіл", "робочому столі", "desktop"]):
             for name in ["Desktop", "Робочий стіл"]:
                 p = os.path.join(home, name)
                 if os.path.isdir(p):
@@ -631,12 +731,11 @@ def execute_cmd(cmd: str):
                     break
 
         if not path:
-            speak("Я не зрозумів, яку папку потрібно відкрити.")
+            speak("Я не зрозумів, яку папку потрібно відкрити або вона не знайдена.")
             return
 
         speak("Відкриваю папку.")
         try:
-            system = platform.system().lower()
             if system.startswith("win"):
                 os.startfile(path)
             elif system == "darwin":
@@ -644,11 +743,10 @@ def execute_cmd(cmd: str):
             else:
                 subprocess.Popen(["xdg-open", path])
         except Exception as e:
-            print(f"[open_folder] помилка: {e}")
+            LOGGER.error("[open_folder] помилка: %s", e)
             speak("Не вдалося відкрити папку.")
 
     elif cmd == "search_file":
-        # намагаємось витягнути назву файлу/документа із voice
         t = voice.lower()
         name_part = ""
         for key in ["файл", "файлик", "документ"]:
@@ -673,7 +771,7 @@ def execute_cmd(cmd: str):
                     found_path = matches[0]
                     break
         except Exception as e:
-            print(f"[search_file] помилка при пошуку: {e}")
+            LOGGER.error("[search_file] помилка при пошуку: %s", e)
 
         if not found_path:
             speak("Я не знайшов такий файл.")
@@ -681,7 +779,6 @@ def execute_cmd(cmd: str):
 
         speak("Знайшов файл, відкриваю.")
         try:
-            system = platform.system().lower()
             if system.startswith("win"):
                 os.startfile(found_path)
             elif system == "darwin":
@@ -689,26 +786,60 @@ def execute_cmd(cmd: str):
             else:
                 subprocess.Popen(["xdg-open", found_path])
         except Exception as e:
-            print(f"[search_file] помилка при відкритті: {e}")
+            LOGGER.error("[search_file] помилка при відкритті: %s", e)
             speak("Не вдалося відкрити файл.")
 
+    elif cmd == "open_website":
+        query = (cleaned_text or voice).strip()
+        if not query:
+            speak("Скажи, який сайт потрібно відкрити.")
+            return
 
-# ---------------------- Аудіо callback ----------------------
+        url = ask_gemini_url(query)
+        if not url:
+            url = "https://www.google.com/search?q=" + urllib.parse.quote_plus(query)
+            speak("Я не зміг визначити конкретний сайт, відкриваю пошук у гуглі.")
+        else:
+            speak("Відкриваю сайт, який найкраще підходить до опису.")
+
+        try:
+            webbrowser.open(url)
+        except Exception as e:
+            LOGGER.error("[open_website] помилка: %s", e)
+            speak("Не вдалося відкрити сайт.")
+
+    else:
+        LOGGER.warning("execute_cmd: невідома команда %s", cmd)
+        speak("Поки що не вмію виконувати цю команду.")
+
+
+# ===================== АУДІО CALLBACK =====================
 
 def audio_callback(indata, frames, time_info, status):
     if status:
-        print(status)
+        LOGGER.warning("Audio status: %s", status)
+    if not MIC_ON:
+        return
     q.put(bytes(indata))
 
 
-# ---------------------- Основний цикл розпізнавання ----------------------
+# ===================== ОСНОВНИЙ ЦИКЛ РОЗПІЗНАВАННЯ =====================
 
 def recognition_loop():
-    global voice
+    """
+    Основний цикл розпізнавання голосу з Vosk.
+    Працює в окремому потоці, читає з черги q,
+    враховує прапор MIC_ON (щоб можна було "вимкнути мікрофон").
+    """
+    global voice, MIC_ON
     print("Система очікує команд...")
 
     while True:
         data = q.get()
+
+        if not MIC_ON:
+            continue
+
         if rec.AcceptWaveform(data):
             result = json.loads(rec.Result())
             text = result.get("text", "")
@@ -721,7 +852,7 @@ def recognition_loop():
             cmd, cleaned_text, has_alias = match_command(text)
 
             if cmd:
-                execute_cmd(cmd)
+                execute_cmd(cmd, cleaned_text)
             else:
                 if has_alias and cleaned_text:
                     answer = ask_smart(cleaned_text)
@@ -734,18 +865,160 @@ def recognition_loop():
                     print("Команда не розпізнана")
 
 
+# ===================== AIoT ШАБЛОН (НА МАЙБУТНЄ) =====================
+
+"""
+# ========== AIoT / SMART HOME ==========
+# Цей блок поки що не використовується. Він показує архітектуру
+# для підключення лампочок, сервоприводів та сенсорів у майбутньому.
+
+class SmartLampController:
+    def __init__(self, port: str):
+        # тут можна ініціалізувати serial / mqtt / http-клієнт
+        self.port = port
+
+    def turn_on(self, room: str | None = None):
+        # надіслати команду "увімкнути лампу" в потрібну кімнату
+        pass
+
+    def turn_off(self, room: str | None = None):
+        pass
+
+class ServoController:
+    def __init__(self, port: str):
+        self.port = port
+
+    def set_angle(self, angle: int):
+        # від 0 до 180
+        pass
+
+class SensorHub:
+    def __init__(self, port: str):
+        self.port = port
+
+    def read_temperature(self) -> float:
+        # прочитати значення з температурного сенсора
+        return 0.0
+
+# Приклад використання:
+# lamp = SmartLampController("/dev/ttyUSB0")
+# servo = ServoController("/dev/ttyUSB1")
+# sensors = SensorHub("/dev/ttyUSB2")
+#
+# І далі в execute_cmd можна буде додати intent'и:
+# - "turn_on_lamp"
+# - "turn_off_lamp"
+# - "set_servo_angle"
+# - "get_temperature"
+"""
+
+# ===================== MAIN =====================
+
 def main():
+    """
+    Точка входу:
+    - друкує мануал у консоль;
+    - запускає потік розпізнавання Vosk;
+    - запускає потік мікрофона;
+    - стартує графічний UI з текстовим вводом як у чаті.
+    """
     print_manual()
-    threading = __import__("threading")
+
+    # ----------------- CALLBACK-и ДЛЯ UI -----------------
+
+    def on_ui_send_text(text: str):
+        """
+        Обробка вводу з текстового поля UI.
+
+        Логіка:
+          1) спочатку завжди пробуємо знайти команду;
+          2) якщо команда знайдена — виконуємо її (незалежно від alias);
+          3) якщо команди немає:
+             - якщо LLM вимкнена → просто кажемо, що не розумію;
+             - якщо LLM увімкнена → відправляємо питання в LLM.
+        """
+        global voice
+        voice = text.strip()
+        if not voice:
+            return
+
+        # показуємо текст у чаті як репліку користувача
+        ui_add_message("user", voice)
+
+        cmd, cleaned_text, has_alias = match_command(voice)
+
+        # 1) якщо команда знайдена — виконуємо її завжди
+        if cmd:
+            execute_cmd(cmd, cleaned_text)
+            return
+
+        # 2) команди немає, дивимось на LLM
+        if LLM_BACKEND == "off":
+            msg = "Команда не розпізнана. LLM зараз вимкнена."
+            ui_add_message("assistant", msg)
+            speak(msg)
+            return
+
+        # текст для моделі:
+        #   якщо є alias і cleaned_text → беремо cleaned_text (без «петро» і службових слів)
+        #   інакше → весь voice
+        question = cleaned_text if (has_alias and cleaned_text) else voice
+
+        answer = ask_smart(question)
+        if answer:
+            ui_add_message("assistant", answer)
+            speak(answer)
+        else:
+            ui_add_message("assistant", "Я не зміг отримати відповідь від моделі.")
+            speak("Я не зміг отримати відповідь від моделі.")
+
+    def on_ui_toggle_mute():
+        """
+        Кнопка Mute в UI — вмикає/вимикає голос (TTS),
+        але логіка/LLM/команди при цьому продовжують працювати.
+        """
+        global MUTED
+        MUTED = not MUTED
+        ui_set_status(muted=MUTED)
+        if MUTED:
+            ui_add_message("assistant", "Тихий режим активовано.")
+        else:
+            ui_add_message("assistant", "Голос увімкнено.")
+
+    def on_ui_toggle_mic():
+        """
+        Кнопка Mic в UI — просто перестає обробляти аудіо з черги q,
+        щоб Петруча «не чув» мікрофон.
+        """
+        global MIC_ON
+        MIC_ON = not MIC_ON
+        ui_set_status(mic_on=MIC_ON)
+        if MIC_ON:
+            ui_add_message("assistant", "Мікрофон увімкнено.")
+        else:
+            ui_add_message("assistant", "Мікрофон вимкнено.")
+
+    # ----------------- ПОТІК РОЗПІЗНАВАННЯ VOSK -----------------
+
     threading.Thread(target=recognition_loop, daemon=True).start()
-    with sd.RawInputStream(
-        samplerate=samplerate,
-        dtype="int16",
-        channels=1,
-        callback=audio_callback,
-    ):
-        while True:
-            sd.sleep(1000)
+
+    # ----------------- ПОТІК МІКРОФОНА -----------------
+
+    def mic_loop():
+        with sd.RawInputStream(
+            samplerate=samplerate,
+            dtype="int16",
+            channels=1,
+            callback=audio_callback,
+        ):
+            while True:
+                sd.sleep(1000)
+
+    threading.Thread(target=mic_loop, daemon=True).start()
+
+    # ----------------- Старт UI (ГОЛОВНИЙ ПОТІК) -----------------
+
+    start_ui(on_ui_send_text, on_ui_toggle_mute, on_ui_toggle_mic)
 
 
 if __name__ == "__main__":

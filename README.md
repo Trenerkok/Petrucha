@@ -27,7 +27,7 @@
     pip install -r requirements.txt
     ```
 Для Windows
-1. Завантажте Zip а саме гілку Phenix_2-0 і розпакуйте у зручне місце для вас
+1. Завантажте Zip а саме гілку [Phenix_2-0](https://github.com/Trenerkok/Petrucha/tree/Phenix_2-0) і розпакуйте у зручне місце для вас
 2. Завантажте всі залежності перебуваючі у папці з проєктом
     ```
     pip install -r requirements.txt

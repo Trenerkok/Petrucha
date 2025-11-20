@@ -1,0 +1,91 @@
+{
+  "stt_backend": "vosk",
+  "llm_backend": "local",
+  "tts_engine": "gtts",
+  "muted": false,
+  "gemini_key": "AIzaSyAxahMoZhuc1ghTS2hhP-rXZMPgnYyh8GE",
+  "gemini_model": "gemini-2.5-flash",
+  "local_llm_url": "http://127.0.0.1:1234",
+  "entries": [
+    {
+      "id": "1469a858",
+      "name": "LM Studio",
+      "voice_phrases": [
+        "нейронки",
+        "нейромережі",
+        "llm",
+        "lm"
+      ],
+      "type": "app",
+      "path": "C:/AI/LM Studio/LM Studio.exe"
+    },
+    {
+      "id": "052d1ffc",
+      "name": "Telegram",
+      "voice_phrases": [
+        "телеграм",
+        "telegram"
+      ],
+      "type": "app",
+      "path": "C:\\Users\\Trener\\AppData\\Roaming\\Telegram Desktop\\Telegram.exe"
+    },
+    {
+      "id": "d1f2681b",
+      "name": "Discord",
+      "voice_phrases": [
+        "discord",
+        "діскорд"
+      ],
+      "type": "app",
+      "path": "C:\\Users\\Trener\\AppData\\Local\\Discord\\Update.exe --processStart Discord.exe"
+    },
+    {
+      "id": "8e43af1c",
+      "name": "???",
+      "voice_phrases": [
+        "пасхалка",
+        "шутка",
+        "прикол"
+      ],
+      "type": "website",
+      "path": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    },
+    {
+      "id": "7569c808",
+      "name": "тест",
+      "voice_phrases": [
+        "завантаження"
+      ],
+      "type": "folder",
+      "path": "C:/Users/Trener/Downloads"
+    }
+  ],
+  "workspaces": [
+    {
+      "id": "4d4f5c50",
+      "name": "Test",
+      "voice_phrases": [
+        "тест"
+      ],
+      "steps": [
+        {
+          "action": "CLOSE_APP",
+          "target_id": "052d1ffc"
+        }
+      ]
+    }
+  ],
+  "iot_devices": [
+    {
+      "id": "4f45c0a7",
+      "display_name": "arduino",
+      "connection_type": "Serial",
+      "connection_params": {
+        "port": "COM3",
+        "baudrate": 9600
+      },
+      "actions": []
+    }
+  ],
+  "wake_word_enabled": true
+}
